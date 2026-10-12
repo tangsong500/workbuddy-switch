@@ -328,6 +328,33 @@ fn files(root: &Path, output: &mut Vec<PathBuf>) {
     }
 }
 
+/// 目录名是否为「完整绝对路径的编码」。
+///
+/// 各产品把 cwd 按路径分隔符编码成项目目录名：macOS `/Users/apple/proj` →
+/// `Users-apple-proj`、Linux `/home/apple/proj` → `home-apple-proj`、Windows
+/// `C:\Users\apple\proj` → `C-Users-apple-proj`（盘符与分隔符都可能变成 `-`）。
+/// 这些名字会把用户名与父目录带进展示，必须折叠为「未知项目」。
+///
+/// 只认「开头即家目录段」的形状：前导分隔符与可选的 Windows 盘符先剥掉，再检查
+/// 是否以 `users` / `home` 段开头。普通项目名（如 `my-project`）不受影响。
+fn encodes_absolute_path(name: &str) -> bool {
+    let rest = name.trim_start_matches(['-', '_', '/', '\\']);
+    // 剥掉可选的 Windows 盘符前缀：`C:` / `C-` / `C_`。
+    let rest = match rest.as_bytes() {
+        [drive, b':', tail @ ..] | [drive, b'-', tail @ ..] | [drive, b'_', tail @ ..]
+            if drive.is_ascii_alphabetic() =>
+        {
+            std::str::from_utf8(tail).unwrap_or(rest)
+        }
+        _ => rest,
+    };
+    let rest = rest.trim_start_matches(['-', '_', '/', '\\']);
+    let lowered = rest.to_ascii_lowercase();
+    ["users-", "users_", "home-", "home_"]
+        .iter()
+        .any(|marker| lowered.starts_with(marker))
+}
+
 fn project_name(root: &Path, file: &Path) -> String {
     let name = file
         .strip_prefix(root)
@@ -338,7 +365,8 @@ fn project_name(root: &Path, file: &Path) -> String {
     match name {
         // Product directories commonly encode the complete absolute path.
         // Returning that would leak a user name and parent directories.
-        Some(name) if !name.starts_with("Users-") && !name.starts_with("home-") => name.to_string(),
+        // 三平台一致：macOS/Linux 的 `Users-` / `home-` 与 Windows 的盘符编码都要折叠。
+        Some(name) if !encodes_absolute_path(name) => name.to_string(),
         _ => "未知项目".to_string(),
     }
 }
@@ -2125,6 +2153,43 @@ mod tests {
         assert_eq!(value["parseErrors"], 0);
         assert_eq!(value["sessions"].as_array().map(Vec::len), Some(0));
         assert_eq!(value["projects"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// 项目目录名会把 cwd 的完整绝对路径编码进来（路径分隔符替换成 `-`）。这种名字把
+    /// 用户名与父目录带进 Token 统计展示，必须折叠为「未知项目」——三平台一致，含
+    /// Windows 盘符编码；普通项目名不得误伤。
+    #[test]
+    fn project_name_masks_encoded_absolute_paths_on_every_platform() {
+        let root = Path::new("/logs/projects");
+        let masked = [
+            "Users-apple-code-proj",    // macOS：/Users/apple/code/proj
+            "-Users-apple-code-proj",   // 保留前导分隔符的编码实现
+            "home-apple-code-proj",     // Linux：/home/apple/code/proj
+            "C-Users-apple-code-proj",  // Windows：C:\Users\apple\code\proj
+            "C--Users-apple-code-proj", // 盘符与分隔符都被替换
+            "D-home-apple-code-proj",   // 其它盘符
+        ];
+        let mut leaked = Vec::new();
+        for dir in masked {
+            let path = root.join(dir).join("session.jsonl");
+            let got = project_name(root, &path);
+            if got != "未知项目" {
+                leaked.push(format!("{dir} -> {got}"));
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "编码后的绝对路径目录名不得泄漏用户路径，但仍透传：{leaked:?}"
+        );
+
+        for dir in ["my-project", "workbuddy-switch", "fixture-project"] {
+            let path = root.join(dir).join("session.jsonl");
+            assert_eq!(
+                project_name(root, &path),
+                dir,
+                "普通项目名 {dir} 应原样保留"
+            );
+        }
     }
 
     /// 多根共享同一个指纹集：国际版两个根之间重放的同一请求只计一次，
